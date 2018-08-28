@@ -59,6 +59,37 @@
 // wrapper around everything in this file
 #if N_X64 || N_X86 || N_THUMB || N_ARM || N_XTENSA
 
+// C stack layout for native functions:
+//  0:                      mp_code_state_t
+//  emit->stack_start:      nlr_buf_t [optional]            |
+//                          Python object stack             | emit->n_state
+//                          locals (reversed, L0 at end)    |
+//
+// C stack layout for viper functions:
+//  0 = emit->stack_start:  nlr_buf_t [optional]            |
+//                          Python object stack             | emit->n_state
+//                          locals (reversed, L0 at end)    |
+//                          (L0-L2 may be in regs instead)
+
+// Word index of nlr_buf_t.ret_val
+#define NLR_BUF_IDX_RET_VAL (1)
+
+// Whether the native/viper function needs to be wrapped in an exception handler
+#define NEED_GLOBAL_EXC_HANDLER(emit) ((emit)->scope->exc_stack_size > 0)
+
+// Whether registers can be used to store locals (only true if there are no
+// exception handlers, because otherwise an nlr_jump will restore registers to
+// their state at the start of the function and updates to locals will be lost)
+#define CAN_USE_REGS_FOR_LOCALS(emit) ((emit)->scope->exc_stack_size == 0)
+
+// Indices within the local C stack for various variables
+#define LOCAL_IDX_EXC_VAL(emit) ((emit)->stack_start + NLR_BUF_IDX_RET_VAL)
+#define LOCAL_IDX_EXC_HANDLER_PC(emit) ((emit)->stack_start + NLR_BUF_IDX_LOCAL_1)
+#define LOCAL_IDX_LOCAL_VAR(emit, local_num) ((emit)->stack_start + (emit)->n_state - 1 - (local_num))
+
+// number of arguments to viper functions are limited to this value
+#define REG_ARG_NUM (4)
+
 // define additional generic helper macros
 #define ASM_MOV_LOCAL_IMM_VIA(as, local_num, imm, reg_temp) \
     do { \
@@ -117,8 +148,15 @@ typedef struct _stack_info_t {
     } data;
 } stack_info_t;
 
+typedef struct _exc_stack_entry_t {
+    uint16_t label : 15;
+    uint16_t is_finally : 1;
+} exc_stack_entry_t;
+
 struct _emit_t {
     mp_obj_t *error_slot;
+    uint *label_slot;
+    uint exit_label;
     int pass;
 
     bool do_viper_types;
@@ -131,6 +169,10 @@ struct _emit_t {
     mp_uint_t stack_info_alloc;
     stack_info_t *stack_info;
     vtype_kind_t saved_stack_vtype;
+
+    size_t exc_stack_alloc;
+    size_t exc_stack_size;
+    exc_stack_entry_t *exc_stack;
 
     int prelude_offset;
     int const_table_offset;
@@ -145,9 +187,20 @@ struct _emit_t {
     ASM_T *as;
 };
 
-emit_t *EXPORT_FUN(new)(mp_obj_t *error_slot, mp_uint_t max_num_labels) {
+STATIC const uint8_t reg_arg_table[REG_ARG_NUM] = {REG_ARG_1, REG_ARG_2, REG_ARG_3, REG_ARG_4};
+STATIC const uint8_t reg_local_table[REG_LOCAL_NUM] = {REG_LOCAL_1, REG_LOCAL_2, REG_LOCAL_3};
+
+STATIC void emit_native_global_exc_entry(emit_t *emit);
+STATIC void emit_native_global_exc_exit(emit_t *emit);
+
+emit_t *EXPORT_FUN(new)(mp_obj_t *error_slot, uint *label_slot, mp_uint_t max_num_labels) {
     emit_t *emit = m_new0(emit_t, 1);
     emit->error_slot = error_slot;
+    emit->label_slot = label_slot;
+    emit->stack_info_alloc = 8;
+    emit->stack_info = m_new(stack_info_t, emit->stack_info_alloc);
+    emit->exc_stack_alloc = 8;
+    emit->exc_stack = m_new(exc_stack_entry_t, emit->exc_stack_alloc);
     emit->as = m_new0(ASM_T, 1);
     mp_asm_base_init(&emit->as->base, max_num_labels);
     return emit;
@@ -156,6 +209,7 @@ emit_t *EXPORT_FUN(new)(mp_obj_t *error_slot, mp_uint_t max_num_labels) {
 void EXPORT_FUN(free)(emit_t *emit) {
     mp_asm_base_deinit(&emit->as->base, false);
     m_del_obj(ASM_T, emit->as);
+    m_del(exc_stack_entry_t, emit->exc_stack, emit->exc_stack_alloc);
     m_del(vtype_kind_t, emit->local_vtype, emit->local_vtype_alloc);
     m_del(stack_info_t, emit->stack_info, emit->stack_info_alloc);
     m_del_obj(emit_t, emit);
@@ -196,8 +250,6 @@ STATIC void emit_post_push_reg(emit_t *emit, vtype_kind_t vtype, int reg);
 STATIC void emit_native_load_fast(emit_t *emit, qstr qst, mp_uint_t local_num);
 STATIC void emit_native_store_fast(emit_t *emit, qstr qst, mp_uint_t local_num);
 
-#define STATE_START (sizeof(mp_code_state_t) / sizeof(mp_uint_t))
-
 STATIC void emit_native_start_pass(emit_t *emit, pass_kind_t pass, scope_t *scope) {
     DEBUG_printf("start_pass(pass=%u, scope=%p)\n", pass, scope);
 
@@ -211,14 +263,6 @@ STATIC void emit_native_start_pass(emit_t *emit, pass_kind_t pass, scope_t *scop
     if (emit->local_vtype_alloc < scope->num_locals) {
         emit->local_vtype = m_renew(vtype_kind_t, emit->local_vtype, emit->local_vtype_alloc, scope->num_locals);
         emit->local_vtype_alloc = scope->num_locals;
-    }
-
-    // allocate memory for keeping track of the objects on the stack
-    // XXX don't know stack size on entry, and it should be maximum over all scopes
-    // XXX this is such a big hack and really needs to be fixed
-    if (emit->stack_info == NULL) {
-        emit->stack_info_alloc = scope->stack_size + 200;
-        emit->stack_info = m_new(stack_info_t, emit->stack_info_alloc);
     }
 
     // set default type for return
@@ -254,22 +298,27 @@ STATIC void emit_native_start_pass(emit_t *emit, pass_kind_t pass, scope_t *scop
     if (emit->do_viper_types) {
 
         // right now we have a restriction of maximum of 4 arguments
-        if (scope->num_pos_args >= 5) {
+        if (scope->num_pos_args > REG_ARG_NUM) {
             EMIT_NATIVE_VIPER_TYPE_ERROR(emit, "Viper functions don't currently support more than 4 arguments");
             return;
         }
 
-        // entry to function
-        int num_locals = 0;
-        if (pass > MP_PASS_SCOPE) {
-            num_locals = scope->num_locals - REG_LOCAL_NUM;
-            if (num_locals < 0) {
-                num_locals = 0;
+        // Work out size of state (locals plus stack)
+        // n_state counts all stack and locals, even those in registers
+        emit->n_state = scope->num_locals + scope->stack_size;
+        int num_locals_in_regs = 0;
+        if (CAN_USE_REGS_FOR_LOCALS(emit)) {
+            num_locals_in_regs = scope->num_locals;
+            if (num_locals_in_regs > REG_LOCAL_NUM) {
+                num_locals_in_regs = REG_LOCAL_NUM;
             }
-            emit->stack_start = num_locals;
-            num_locals += scope->stack_size;
         }
-        ASM_ENTRY(emit->as, num_locals);
+
+        // The locals and stack start at the beginning of the C stack
+        emit->stack_start = 0;
+
+        // Entry to function
+        ASM_ENTRY(emit->as, emit->stack_start + emit->n_state - num_locals_in_regs);
 
         // TODO don't load r7 if we don't need it
         #if N_THUMB
@@ -278,40 +327,38 @@ STATIC void emit_native_start_pass(emit_t *emit, pass_kind_t pass, scope_t *scop
         asm_arm_mov_reg_i32(emit->as, ASM_ARM_REG_R7, (mp_uint_t)mp_fun_table);
         #endif
 
+        // Store arguments into locals
         #if N_X86
         for (int i = 0; i < scope->num_pos_args; i++) {
-            if (i == 0) {
-                asm_x86_mov_arg_to_r32(emit->as, i, REG_LOCAL_1);
-            } else if (i == 1) {
-                asm_x86_mov_arg_to_r32(emit->as, i, REG_LOCAL_2);
-            } else if (i == 2) {
-                asm_x86_mov_arg_to_r32(emit->as, i, REG_LOCAL_3);
+            if (i < REG_LOCAL_NUM && CAN_USE_REGS_FOR_LOCALS(emit)) {
+                asm_x86_mov_arg_to_r32(emit->as, i, reg_local_table[i]);
             } else {
                 asm_x86_mov_arg_to_r32(emit->as, i, REG_TEMP0);
-                asm_x86_mov_r32_to_local(emit->as, REG_TEMP0, i - REG_LOCAL_NUM);
+                asm_x86_mov_r32_to_local(emit->as, REG_TEMP0, LOCAL_IDX_LOCAL_VAR(emit, i));
             }
         }
         #else
         for (int i = 0; i < scope->num_pos_args; i++) {
-            if (i == 0) {
-                ASM_MOV_REG_REG(emit->as, REG_LOCAL_1, REG_ARG_1);
-            } else if (i == 1) {
-                ASM_MOV_REG_REG(emit->as, REG_LOCAL_2, REG_ARG_2);
-            } else if (i == 2) {
-                ASM_MOV_REG_REG(emit->as, REG_LOCAL_3, REG_ARG_3);
+            if (i < REG_LOCAL_NUM && CAN_USE_REGS_FOR_LOCALS(emit)) {
+                ASM_MOV_REG_REG(emit->as, reg_local_table[i], reg_arg_table[i]);
             } else {
-                assert(i == 3); // should be true; max 4 args is checked above
-                ASM_MOV_LOCAL_REG(emit->as, i - REG_LOCAL_NUM, REG_ARG_4);
+                assert(i < REG_ARG_NUM); // should be true; max args is checked above
+                ASM_MOV_LOCAL_REG(emit->as, LOCAL_IDX_LOCAL_VAR(emit, i), reg_arg_table[i]);
             }
         }
         #endif
+
+        emit_native_global_exc_entry(emit);
 
     } else {
         // work out size of state (locals plus stack)
         emit->n_state = scope->num_locals + scope->stack_size;
 
+        // the locals and stack start after the code_state structure
+        emit->stack_start = sizeof(mp_code_state_t) / sizeof(mp_uint_t);
+
         // allocate space on C-stack for code_state structure, which includes state
-        ASM_ENTRY(emit->as, STATE_START + emit->n_state);
+        ASM_ENTRY(emit->as, emit->stack_start + emit->n_state);
 
         // TODO don't load r7 if we don't need it
         #if N_THUMB
@@ -348,14 +395,12 @@ STATIC void emit_native_start_pass(emit_t *emit, pass_kind_t pass, scope_t *scop
         ASM_CALL_IND(emit->as, mp_fun_table[MP_F_SETUP_CODE_STATE], MP_F_SETUP_CODE_STATE);
         #endif
 
-        // cache some locals in registers
-        if (scope->num_locals > 0) {
-            ASM_MOV_REG_LOCAL(emit->as, REG_LOCAL_1, STATE_START + emit->n_state - 1 - 0);
-            if (scope->num_locals > 1) {
-                ASM_MOV_REG_LOCAL(emit->as, REG_LOCAL_2, STATE_START + emit->n_state - 1 - 1);
-                if (scope->num_locals > 2) {
-                    ASM_MOV_REG_LOCAL(emit->as, REG_LOCAL_3, STATE_START + emit->n_state - 1 - 2);
-                }
+        emit_native_global_exc_entry(emit);
+
+        // cache some locals in registers, but only if no exception handlers
+        if (CAN_USE_REGS_FOR_LOCALS(emit)) {
+            for (int i = 0; i < REG_LOCAL_NUM && i < scope->num_locals; ++i) {
+                ASM_MOV_REG_LOCAL(emit->as, reg_local_table[i], LOCAL_IDX_LOCAL_VAR(emit, i));
             }
         }
 
@@ -371,9 +416,7 @@ STATIC void emit_native_start_pass(emit_t *emit, pass_kind_t pass, scope_t *scop
 }
 
 STATIC void emit_native_end_pass(emit_t *emit) {
-    if (!emit->last_emit_was_return_value) {
-        ASM_EXIT(emit->as);
-    }
+    emit_native_global_exc_exit(emit);
 
     if (!emit->do_viper_types) {
         emit->prelude_offset = mp_asm_base_get_code_pos(&emit->as->base);
@@ -429,6 +472,7 @@ STATIC void emit_native_end_pass(emit_t *emit) {
 
     // check stack is back to zero size
     assert(emit->stack_size == 0);
+    assert(emit->exc_stack_size == 0);
 
     if (emit->pass == MP_PASS_EMIT) {
         void *f = mp_asm_base_get_code(&emit->as->base);
@@ -452,8 +496,17 @@ STATIC bool emit_native_last_emit_was_return_value(emit_t *emit) {
     return emit->last_emit_was_return_value;
 }
 
+STATIC void ensure_extra_stack(emit_t *emit, size_t delta) {
+    if (emit->stack_size + delta > emit->stack_info_alloc) {
+        size_t new_alloc = (emit->stack_size + delta + 8) & ~3;
+        emit->stack_info = m_renew(stack_info_t, emit->stack_info, emit->stack_info_alloc, new_alloc);
+        emit->stack_info_alloc = new_alloc;
+    }
+}
+
 STATIC void adjust_stack(emit_t *emit, mp_int_t stack_size_delta) {
     assert((mp_int_t)emit->stack_size + stack_size_delta >= 0);
+    assert((mp_int_t)emit->stack_size + stack_size_delta <= (mp_int_t)emit->stack_info_alloc);
     emit->stack_size += stack_size_delta;
     if (emit->pass > MP_PASS_SCOPE && emit->stack_size > emit->scope->stack_size) {
         emit->scope->stack_size = emit->stack_size;
@@ -470,6 +523,9 @@ STATIC void adjust_stack(emit_t *emit, mp_int_t stack_size_delta) {
 
 STATIC void emit_native_adjust_stack_size(emit_t *emit, mp_int_t delta) {
     DEBUG_printf("adjust_stack_size(" INT_FMT ")\n", delta);
+    if (delta > 0) {
+        ensure_extra_stack(emit, delta);
+    }
     // If we are adjusting the stack in a positive direction (pushing) then we
     // need to fill in values for the stack kind and vtype of the newly-pushed
     // entries.  These should be set to "value" (ie not reg or imm) because we
@@ -637,6 +693,7 @@ STATIC void emit_post_top_set_vtype(emit_t *emit, vtype_kind_t new_vtype) {
 }
 
 STATIC void emit_post_push_reg(emit_t *emit, vtype_kind_t vtype, int reg) {
+    ensure_extra_stack(emit, 1);
     stack_info_t *si = &emit->stack_info[emit->stack_size];
     si->vtype = vtype;
     si->kind = STACK_REG;
@@ -645,6 +702,7 @@ STATIC void emit_post_push_reg(emit_t *emit, vtype_kind_t vtype, int reg) {
 }
 
 STATIC void emit_post_push_imm(emit_t *emit, vtype_kind_t vtype, mp_int_t imm) {
+    ensure_extra_stack(emit, 1);
     stack_info_t *si = &emit->stack_info[emit->stack_size];
     si->vtype = vtype;
     si->kind = STACK_IMM;
@@ -766,6 +824,7 @@ STATIC void emit_get_stack_pointer_to_reg_for_pop(emit_t *emit, mp_uint_t reg_de
 // vtype of all n_push objects is VTYPE_PYOBJ
 STATIC void emit_get_stack_pointer_to_reg_for_push(emit_t *emit, mp_uint_t reg_dest, mp_uint_t n_push) {
     need_reg_all(emit);
+    ensure_extra_stack(emit, n_push);
     for (mp_uint_t i = 0; i < n_push; i++) {
         emit->stack_info[emit->stack_size + i].kind = STACK_VALUE;
         emit->stack_info[emit->stack_size + i].vtype = VTYPE_PYOBJ;
@@ -774,13 +833,122 @@ STATIC void emit_get_stack_pointer_to_reg_for_push(emit_t *emit, mp_uint_t reg_d
     adjust_stack(emit, n_push);
 }
 
+STATIC void emit_native_push_exc_stack(emit_t *emit, uint label, bool is_finally) {
+    if (emit->exc_stack_size + 1 > emit->exc_stack_alloc) {
+        size_t new_alloc = emit->exc_stack_alloc + 4;
+        emit->exc_stack = m_renew(exc_stack_entry_t, emit->exc_stack, emit->exc_stack_alloc, new_alloc);
+        emit->exc_stack_alloc = new_alloc;
+    }
+
+    exc_stack_entry_t *e = &emit->exc_stack[emit->exc_stack_size++];
+    e->label = label;
+    e->is_finally = is_finally;
+
+    ASM_MOV_REG_PCREL(emit->as, REG_RET, label);
+    ASM_MOV_LOCAL_REG(emit->as, LOCAL_IDX_EXC_HANDLER_PC(emit), REG_RET);
+}
+
+STATIC void emit_native_pop_exc_stack(emit_t *emit, bool do_pop) {
+    assert(emit->exc_stack_size > 0);
+    if (emit->exc_stack_size == 1) {
+        if (do_pop) {
+            --emit->exc_stack_size;
+            return;
+        }
+        ASM_XOR_REG_REG(emit->as, REG_RET, REG_RET);
+    } else {
+        uint label = emit->exc_stack[emit->exc_stack_size - 2].label;
+        ASM_MOV_REG_PCREL(emit->as, REG_RET, label);
+    }
+    ASM_MOV_LOCAL_REG(emit->as, LOCAL_IDX_EXC_HANDLER_PC(emit), REG_RET);
+    if (do_pop) {
+        --emit->exc_stack_size;
+    }
+}
+
 STATIC void emit_native_label_assign(emit_t *emit, mp_uint_t l) {
     DEBUG_printf("label_assign(" UINT_FMT ")\n", l);
+
+    bool is_finally = false;
+    if (emit->exc_stack_size > 0) {
+       exc_stack_entry_t *e = &emit->exc_stack[emit->exc_stack_size - 1];
+       is_finally = e->is_finally && e->label == l;
+    }
+
+    if (is_finally) {
+        // Label is at start of finally handler: store TOS into exception slot
+        vtype_kind_t vtype;
+        emit_pre_pop_reg(emit, &vtype, REG_TEMP0);
+        ASM_MOV_LOCAL_REG(emit->as, LOCAL_IDX_EXC_VAL(emit), REG_TEMP0);
+    }
+
     emit_native_pre(emit);
     // need to commit stack because we can jump here from elsewhere
     need_stack_settled(emit);
     mp_asm_base_label_assign(&emit->as->base, l);
     emit_post(emit);
+
+    if (is_finally) {
+        // Label is at start of finally handler: pop exception stack
+        emit_native_pop_exc_stack(emit, true);
+    }
+}
+
+STATIC void emit_native_global_exc_entry(emit_t *emit) {
+    // Note: 4 labels are reserved for this function, starting at *emit->label_slot
+
+    emit->exit_label = *emit->label_slot;
+
+    if (NEED_GLOBAL_EXC_HANDLER(emit)) {
+        mp_uint_t nlr_label = *emit->label_slot + 1;
+        mp_uint_t start_label = *emit->label_slot + 2;
+        mp_uint_t global_except_label = *emit->label_slot + 3;
+
+        // Put PC of start code block into REG_LOCAL_1
+        ASM_MOV_REG_PCREL(emit->as, REG_LOCAL_1, start_label);
+
+        // Wrap everything in an nlr context
+        emit_native_label_assign(emit, nlr_label);
+        emit_get_stack_pointer_to_reg_for_push(emit, REG_ARG_1, sizeof(nlr_buf_t) / sizeof(uintptr_t));
+        emit_call(emit, MP_F_NLR_PUSH);
+        ASM_JUMP_IF_REG_NONZERO(emit->as, REG_RET, global_except_label, true);
+
+        // Clear PC of current code block, and jump there to resume execution
+        ASM_XOR_REG_REG(emit->as, REG_TEMP0, REG_TEMP0);
+        ASM_MOV_LOCAL_REG(emit->as, LOCAL_IDX_EXC_HANDLER_PC(emit), REG_TEMP0);
+        ASM_JUMP_REG(emit->as, REG_LOCAL_1);
+
+        // Global exception handler: check for valid exception handler
+        emit_native_label_assign(emit, global_except_label);
+        ASM_MOV_REG_LOCAL(emit->as, REG_LOCAL_1, LOCAL_IDX_EXC_HANDLER_PC(emit));
+        ASM_JUMP_IF_REG_NONZERO(emit->as, REG_LOCAL_1, nlr_label, false);
+
+        // Re-raise exception out to caller
+        ASM_MOV_REG_LOCAL(emit->as, REG_ARG_1, LOCAL_IDX_EXC_VAL(emit));
+        emit_call(emit, MP_F_NATIVE_RAISE);
+
+        // Label for start of function
+        emit_native_label_assign(emit, start_label);
+    }
+}
+
+STATIC void emit_native_global_exc_exit(emit_t *emit) {
+    // Label for end of function
+    emit_native_label_assign(emit, emit->exit_label);
+
+    if (NEED_GLOBAL_EXC_HANDLER(emit)) {
+        // Save return value
+        ASM_MOV_REG_REG(emit->as, REG_LOCAL_1, REG_RET);
+
+        // Pop the nlr context
+        emit_call(emit, MP_F_NLR_POP);
+        adjust_stack(emit, -(mp_int_t)(sizeof(nlr_buf_t) / sizeof(uintptr_t)));
+
+        // Restore return value
+        ASM_MOV_REG_REG(emit->as, REG_RET, REG_LOCAL_1);
+    }
+
+    ASM_EXIT(emit->as);
 }
 
 STATIC void emit_native_import_name(emit_t *emit, qstr qst) {
@@ -919,19 +1087,11 @@ STATIC void emit_native_load_fast(emit_t *emit, qstr qst, mp_uint_t local_num) {
         EMIT_NATIVE_VIPER_TYPE_ERROR(emit, "local '%q' used before type known", qst);
     }
     emit_native_pre(emit);
-    if (local_num == 0) {
-        emit_post_push_reg(emit, vtype, REG_LOCAL_1);
-    } else if (local_num == 1) {
-        emit_post_push_reg(emit, vtype, REG_LOCAL_2);
-    } else if (local_num == 2) {
-        emit_post_push_reg(emit, vtype, REG_LOCAL_3);
+    if (local_num < REG_LOCAL_NUM && CAN_USE_REGS_FOR_LOCALS(emit)) {
+        emit_post_push_reg(emit, vtype, reg_local_table[local_num]);
     } else {
         need_reg_single(emit, REG_TEMP0, 0);
-        if (emit->do_viper_types) {
-            ASM_MOV_REG_LOCAL(emit->as, REG_TEMP0, local_num - REG_LOCAL_NUM);
-        } else {
-            ASM_MOV_REG_LOCAL(emit->as, REG_TEMP0, STATE_START + emit->n_state - 1 - local_num);
-        }
+        ASM_MOV_REG_LOCAL(emit->as, REG_TEMP0, LOCAL_IDX_LOCAL_VAR(emit, local_num));
         emit_post_push_reg(emit, vtype, REG_TEMP0);
     }
 }
@@ -1160,19 +1320,11 @@ STATIC void emit_native_load_subscr(emit_t *emit) {
 
 STATIC void emit_native_store_fast(emit_t *emit, qstr qst, mp_uint_t local_num) {
     vtype_kind_t vtype;
-    if (local_num == 0) {
-        emit_pre_pop_reg(emit, &vtype, REG_LOCAL_1);
-    } else if (local_num == 1) {
-        emit_pre_pop_reg(emit, &vtype, REG_LOCAL_2);
-    } else if (local_num == 2) {
-        emit_pre_pop_reg(emit, &vtype, REG_LOCAL_3);
+    if (local_num < REG_LOCAL_NUM && CAN_USE_REGS_FOR_LOCALS(emit)) {
+        emit_pre_pop_reg(emit, &vtype, reg_local_table[local_num]);
     } else {
         emit_pre_pop_reg(emit, &vtype, REG_TEMP0);
-        if (emit->do_viper_types) {
-            ASM_MOV_LOCAL_REG(emit->as, local_num - REG_LOCAL_NUM, REG_TEMP0);
-        } else {
-            ASM_MOV_LOCAL_REG(emit->as, STATE_START + emit->n_state - 1 - local_num, REG_TEMP0);
-        }
+        ASM_MOV_LOCAL_REG(emit->as, LOCAL_IDX_LOCAL_VAR(emit, local_num), REG_TEMP0);
     }
     emit_post(emit);
 
@@ -1320,10 +1472,6 @@ STATIC void emit_native_store_subscr(emit_t *emit) {
                         }
                         #endif
                         ASM_MOV_REG_IMM(emit->as, reg_index, index_value << 1);
-                        #if N_ARM
-                        asm_arm_strh_reg_reg_reg(emit->as, reg_value, reg_base, reg_index);
-                        return;
-                        #endif
                         ASM_ADD_REG_REG(emit->as, reg_index, reg_base); // add 2*index to base
                         reg_base = reg_index;
                     }
@@ -1340,11 +1488,12 @@ STATIC void emit_native_store_subscr(emit_t *emit) {
                             break;
                         }
                         #endif
-                        ASM_MOV_REG_IMM(emit->as, reg_index, index_value << 2);
                         #if N_ARM
+                        ASM_MOV_REG_IMM(emit->as, reg_index, index_value);
                         asm_arm_str_reg_reg_reg(emit->as, reg_value, reg_base, reg_index);
                         return;
                         #endif
+                        ASM_MOV_REG_IMM(emit->as, reg_index, index_value << 2);
                         ASM_ADD_REG_REG(emit->as, reg_index, reg_base); // add 4*index to base
                         reg_base = reg_index;
                     }
@@ -1520,7 +1669,7 @@ STATIC void emit_native_jump(emit_t *emit, mp_uint_t label) {
     emit_post(emit);
 }
 
-STATIC void emit_native_jump_helper(emit_t *emit, bool pop) {
+STATIC void emit_native_jump_helper(emit_t *emit, bool cond, mp_uint_t label, bool pop) {
     vtype_kind_t vtype = peek_vtype(emit, 0);
     if (vtype == VTYPE_PYOBJ) {
         emit_pre_pop_reg(emit, &vtype, REG_ARG_1);
@@ -1545,29 +1694,26 @@ STATIC void emit_native_jump_helper(emit_t *emit, bool pop) {
     }
     // need to commit stack because we may jump elsewhere
     need_stack_settled(emit);
+    // Emit the jump
+    if (cond) {
+        ASM_JUMP_IF_REG_NONZERO(emit->as, REG_RET, label, vtype == VTYPE_PYOBJ);
+    } else {
+        ASM_JUMP_IF_REG_ZERO(emit->as, REG_RET, label, vtype == VTYPE_PYOBJ);
+    }
+    if (!pop) {
+        adjust_stack(emit, -1);
+    }
+    emit_post(emit);
 }
 
 STATIC void emit_native_pop_jump_if(emit_t *emit, bool cond, mp_uint_t label) {
     DEBUG_printf("pop_jump_if(cond=%u, label=" UINT_FMT ")\n", cond, label);
-    emit_native_jump_helper(emit, true);
-    if (cond) {
-        ASM_JUMP_IF_REG_NONZERO(emit->as, REG_RET, label);
-    } else {
-        ASM_JUMP_IF_REG_ZERO(emit->as, REG_RET, label);
-    }
-    emit_post(emit);
+    emit_native_jump_helper(emit, cond, label, true);
 }
 
 STATIC void emit_native_jump_if_or_pop(emit_t *emit, bool cond, mp_uint_t label) {
     DEBUG_printf("jump_if_or_pop(cond=%u, label=" UINT_FMT ")\n", cond, label);
-    emit_native_jump_helper(emit, false);
-    if (cond) {
-        ASM_JUMP_IF_REG_NONZERO(emit->as, REG_RET, label);
-    } else {
-        ASM_JUMP_IF_REG_ZERO(emit->as, REG_RET, label);
-    }
-    adjust_stack(emit, -1);
-    emit_post(emit);
+    emit_native_jump_helper(emit, cond, label, false);
 }
 
 STATIC void emit_native_unwind_jump(emit_t *emit, mp_uint_t label, mp_uint_t except_depth) {
@@ -1608,13 +1754,10 @@ STATIC void emit_native_setup_with(emit_t *emit, mp_uint_t label) {
 
     // need to commit stack because we may jump elsewhere
     need_stack_settled(emit);
-    emit_get_stack_pointer_to_reg_for_push(emit, REG_ARG_1, sizeof(nlr_buf_t) / sizeof(mp_uint_t)); // arg1 = pointer to nlr buf
-    emit_call(emit, MP_F_NLR_PUSH);
-    ASM_JUMP_IF_REG_NONZERO(emit->as, REG_RET, label);
+    emit_native_push_exc_stack(emit, label, false);
 
-    emit_access_stack(emit, sizeof(nlr_buf_t) / sizeof(mp_uint_t) + 1, &vtype, REG_RET); // access return value of __enter__
-    emit_post_push_reg(emit, VTYPE_PYOBJ, REG_RET); // push return value of __enter__
-    // stack: (..., __exit__, self, as_value, nlr_buf, as_value)
+    emit_native_dup_top(emit);
+    // stack: (..., __exit__, self, as_value, as_value)
 }
 
 STATIC void emit_native_setup_block(emit_t *emit, mp_uint_t label, int kind) {
@@ -1623,22 +1766,19 @@ STATIC void emit_native_setup_block(emit_t *emit, mp_uint_t label, int kind) {
     } else {
         // Set up except and finally
         emit_native_pre(emit);
-        // need to commit stack because we may jump elsewhere
         need_stack_settled(emit);
-        emit_get_stack_pointer_to_reg_for_push(emit, REG_ARG_1, sizeof(nlr_buf_t) / sizeof(mp_uint_t)); // arg1 = pointer to nlr buf
-        emit_call(emit, MP_F_NLR_PUSH);
-        ASM_JUMP_IF_REG_NONZERO(emit->as, REG_RET, label);
+        emit_native_push_exc_stack(emit, label, kind == MP_EMIT_SETUP_BLOCK_FINALLY);
         emit_post(emit);
     }
 }
 
 STATIC void emit_native_with_cleanup(emit_t *emit, mp_uint_t label) {
-    // note: label+1 is available as an auxiliary label
+    // Note: 2 labels are reserved for this function, starting at *emit->label_slot
 
-    // stack: (..., __exit__, self, as_value, nlr_buf)
+    // stack: (..., __exit__, self, as_value)
     emit_native_pre(emit);
-    emit_call(emit, MP_F_NLR_POP);
-    adjust_stack(emit, -(mp_int_t)(sizeof(nlr_buf_t) / sizeof(mp_uint_t)) - 1);
+    emit_native_pop_exc_stack(emit, false);
+    adjust_stack(emit, -1);
     // stack: (..., __exit__, self)
 
     // call __exit__
@@ -1648,57 +1788,47 @@ STATIC void emit_native_with_cleanup(emit_t *emit, mp_uint_t label) {
     emit_get_stack_pointer_to_reg_for_pop(emit, REG_ARG_3, 5);
     emit_call_with_2_imm_args(emit, MP_F_CALL_METHOD_N_KW, 3, REG_ARG_1, 0, REG_ARG_2);
 
-    // jump to after with cleanup nlr_catch block
-    adjust_stack(emit, 1); // dummy nlr_buf.prev
-    emit_native_load_const_tok(emit, MP_TOKEN_KW_NONE); // nlr_buf.ret_val = no exception
-    emit_native_jump(emit, label + 1);
+    // Replace exc with None and finish
+    emit_native_jump(emit, *emit->label_slot);
 
     // nlr_catch
     emit_native_label_assign(emit, label);
 
-    // adjust stack counter for: __exit__, self, as_value
-    adjust_stack(emit, 3);
-    // stack: (..., __exit__, self, as_value, nlr_buf.prev, nlr_buf.ret_val)
+    // Pop with's exception handler
+    emit_native_pop_exc_stack(emit, true);
 
-    vtype_kind_t vtype;
-    emit_pre_pop_reg(emit, &vtype, REG_ARG_1); // get the thrown value (exc)
-    adjust_stack(emit, -2); // discard nlr_buf.prev and as_value
+    // Adjust stack counter for: __exit__, self (implicitly discard as_value which is above self)
+    emit_native_adjust_stack_size(emit, 2);
     // stack: (..., __exit__, self)
-    // REG_ARG_1=exc
 
-    emit_pre_pop_reg(emit, &vtype, REG_ARG_2); // self
-    emit_pre_pop_reg(emit, &vtype, REG_ARG_3); // __exit__
-    adjust_stack(emit, 1); // dummy nlr_buf.prev
-    emit_post_push_reg(emit, vtype, REG_ARG_1); // push exc to save it for later
-    emit_post_push_reg(emit, vtype, REG_ARG_3); // __exit__
-    emit_post_push_reg(emit, vtype, REG_ARG_2); // self
-    // stack: (..., exc, __exit__, self)
-    // REG_ARG_1=exc
-
+    ASM_MOV_REG_LOCAL(emit->as, REG_ARG_1, LOCAL_IDX_EXC_VAL(emit)); // get exc
     ASM_LOAD_REG_REG_OFFSET(emit->as, REG_ARG_2, REG_ARG_1, 0); // get type(exc)
     emit_post_push_reg(emit, VTYPE_PYOBJ, REG_ARG_2); // push type(exc)
     emit_post_push_reg(emit, VTYPE_PYOBJ, REG_ARG_1); // push exc value
     emit_post_push_imm(emit, VTYPE_PYOBJ, (mp_uint_t)mp_const_none); // traceback info
-    // stack: (..., exc, __exit__, self, type(exc), exc, traceback)
+    // Stack: (..., __exit__, self, type(exc), exc, traceback)
 
     // call __exit__ method
     emit_get_stack_pointer_to_reg_for_pop(emit, REG_ARG_3, 5);
     emit_call_with_2_imm_args(emit, MP_F_CALL_METHOD_N_KW, 3, REG_ARG_1, 0, REG_ARG_2);
-    // stack: (..., exc)
+    // Stack: (...)
 
-    // if REG_RET is true then we need to replace top-of-stack with None (swallow exception)
+    // If REG_RET is true then we need to replace exception with None (swallow exception)
     if (REG_ARG_1 != REG_RET) {
         ASM_MOV_REG_REG(emit->as, REG_ARG_1, REG_RET);
     }
     emit_call(emit, MP_F_OBJ_IS_TRUE);
-    ASM_JUMP_IF_REG_ZERO(emit->as, REG_RET, label + 1);
+    ASM_JUMP_IF_REG_ZERO(emit->as, REG_RET, *emit->label_slot + 1, true);
 
-    // replace exc with None
-    emit_pre_pop_discard(emit);
-    emit_post_push_imm(emit, VTYPE_PYOBJ, (mp_uint_t)mp_const_none);
+    // Replace exception with None
+    emit_native_label_assign(emit, *emit->label_slot);
+    ASM_MOV_REG_IMM(emit->as, REG_TEMP0, (mp_uint_t)mp_const_none);
+    ASM_MOV_LOCAL_REG(emit->as, LOCAL_IDX_EXC_VAL(emit), REG_TEMP0);
 
     // end of with cleanup nlr_catch block
-    emit_native_label_assign(emit, label + 1);
+    emit_native_label_assign(emit, *emit->label_slot + 1);
+
+    // Exception is in nlr_buf.ret_val slot
 }
 
 STATIC void emit_native_end_finally(emit_t *emit) {
@@ -1707,9 +1837,8 @@ STATIC void emit_native_end_finally(emit_t *emit) {
     //   if exc == None: pass
     //   else: raise exc
     // the check if exc is None is done in the MP_F_NATIVE_RAISE stub
-    vtype_kind_t vtype;
-    emit_pre_pop_reg(emit, &vtype, REG_ARG_1); // get nlr_buf.ret_val
-    emit_pre_pop_discard(emit); // discard nlr_buf.prev
+    emit_native_pre(emit);
+    ASM_MOV_REG_LOCAL(emit->as, REG_ARG_1, LOCAL_IDX_EXC_VAL(emit));
     emit_call(emit, MP_F_NATIVE_RAISE);
     emit_post(emit);
 }
@@ -1739,7 +1868,7 @@ STATIC void emit_native_for_iter(emit_t *emit, mp_uint_t label) {
     emit_call(emit, MP_F_NATIVE_ITERNEXT);
     #ifdef NDEBUG
     MP_STATIC_ASSERT(MP_OBJ_STOP_ITERATION == 0);
-    ASM_JUMP_IF_REG_ZERO(emit->as, REG_RET, label);
+    ASM_JUMP_IF_REG_ZERO(emit->as, REG_RET, label, false);
     #else
     ASM_MOV_REG_IMM(emit->as, REG_TEMP1, (mp_uint_t)MP_OBJ_STOP_ITERATION);
     ASM_JUMP_IF_REG_EQ(emit->as, REG_RET, REG_TEMP1, label);
@@ -1756,8 +1885,9 @@ STATIC void emit_native_for_iter_end(emit_t *emit) {
 
 STATIC void emit_native_pop_block(emit_t *emit) {
     emit_native_pre(emit);
-    emit_call(emit, MP_F_NLR_POP);
-    adjust_stack(emit, -(mp_int_t)(sizeof(nlr_buf_t) / sizeof(mp_uint_t)) + 1);
+    if (!emit->exc_stack[emit->exc_stack_size - 1].is_finally) {
+        emit_native_pop_exc_stack(emit, false);
+    }
     emit_post(emit);
 }
 
@@ -2183,7 +2313,7 @@ STATIC void emit_native_return_value(emit_t *emit) {
         assert(vtype == VTYPE_PYOBJ);
     }
     emit->last_emit_was_return_value = true;
-    ASM_EXIT(emit->as);
+    ASM_JUMP(emit->as, emit->exit_label);
 }
 
 STATIC void emit_native_raise_varargs(emit_t *emit, mp_uint_t n_args) {
@@ -2205,18 +2335,16 @@ STATIC void emit_native_yield(emit_t *emit, int kind) {
 }
 
 STATIC void emit_native_start_except_handler(emit_t *emit) {
-    // This instruction follows an nlr_pop, so the stack counter is back to zero, when really
-    // it should be up by a whole nlr_buf_t.  We then want to pop the nlr_buf_t here, but save
-    // the first 2 elements, so we can get the thrown value.
-    adjust_stack(emit, 1);
-    vtype_kind_t vtype_nlr;
-    emit_pre_pop_reg(emit, &vtype_nlr, REG_ARG_1); // get the thrown value
-    emit_pre_pop_discard(emit); // discard the linked-list pointer in the nlr_buf
-    emit_post_push_reg_reg_reg(emit, VTYPE_PYOBJ, REG_ARG_1, VTYPE_PYOBJ, REG_ARG_1, VTYPE_PYOBJ, REG_ARG_1); // push the 3 exception items
+    // Protected block has finished so pop the exception stack
+    emit_native_pop_exc_stack(emit, true);
+
+    // Get and push nlr_buf.ret_val
+    ASM_MOV_REG_LOCAL(emit->as, REG_TEMP0, LOCAL_IDX_EXC_VAL(emit));
+    emit_post_push_reg(emit, VTYPE_PYOBJ, REG_TEMP0);
 }
 
 STATIC void emit_native_end_except_handler(emit_t *emit) {
-    adjust_stack(emit, -1);
+    adjust_stack(emit, -1); // pop the exception (end_finally didn't use it)
 }
 
 const emit_method_table_t EXPORT_FUN(method_table) = {

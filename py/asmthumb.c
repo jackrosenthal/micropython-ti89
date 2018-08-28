@@ -310,6 +310,15 @@ void asm_thumb_mov_reg_local_addr(asm_thumb_t *as, uint rlo_dest, int local_num)
     asm_thumb_op16(as, OP_ADD_REG_SP_OFFSET(rlo_dest, word_offset));
 }
 
+void asm_thumb_mov_reg_pcrel(asm_thumb_t *as, uint rlo_dest, uint label) {
+    mp_uint_t dest = get_label_dest(as, label);
+    mp_int_t rel = dest - as->base.code_offset;
+    rel -= 4 + 4; // adjust for mov_reg_i16 and then PC+4 prefetch of add_reg_reg
+    rel |= 1; // to stay in Thumb state when jumping to this address
+    asm_thumb_mov_reg_i16(as, ASM_THUMB_OP_MOVW, rlo_dest, rel); // 4 bytes
+    asm_thumb_add_reg_reg(as, rlo_dest, ASM_THUMB_REG_R15); // 2 bytes
+}
+
 // this could be wrong, because it should have a range of +/- 16MiB...
 #define OP_BW_HI(byte_offset) (0xf000 | (((byte_offset) >> 12) & 0x07ff))
 #define OP_BW_LO(byte_offset) (0xb800 | (((byte_offset) >> 1) & 0x07ff))
@@ -353,6 +362,8 @@ void asm_thumb_bcc_label(asm_thumb_t *as, int cond, uint label) {
 }
 
 #define OP_BLX(reg) (0x4780 | ((reg) << 3))
+#define OP_LDR_W_HI(reg_base) (0xf8d0 | (reg_base))
+#define OP_LDR_W_LO(reg_dest, imm12) ((reg_dest) << 12 | (imm12))
 #define OP_SVC(arg) (0xdf00 | (arg))
 
 void asm_thumb_bl_ind(asm_thumb_t *as, void *fun_ptr, uint fun_id, uint reg_temp) {
@@ -370,8 +381,8 @@ void asm_thumb_bl_ind(asm_thumb_t *as, void *fun_ptr, uint fun_id, uint reg_temp
         asm_thumb_op16(as, ASM_THUMB_FORMAT_9_10_ENCODE(ASM_THUMB_FORMAT_9_LDR | ASM_THUMB_FORMAT_9_WORD_TRANSFER, reg_temp, ASM_THUMB_REG_R7, fun_id));
         asm_thumb_op16(as, OP_BLX(reg_temp));
     } else {
-        // load ptr to function into register using immediate; 6 bytes
-        asm_thumb_mov_reg_i32(as, reg_temp, (mp_uint_t)fun_ptr);
+        // load ptr to function from table, indexed by fun_id using wide load; 6 bytes
+        asm_thumb_op32(as, OP_LDR_W_HI(ASM_THUMB_REG_R7), OP_LDR_W_LO(reg_temp, fun_id << 2));
         asm_thumb_op16(as, OP_BLX(reg_temp));
     }
 }

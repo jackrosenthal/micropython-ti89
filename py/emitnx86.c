@@ -9,6 +9,9 @@
 #define GENERIC_ASM_API (1)
 #include "py/asmx86.h"
 
+// Word index of REG_LOCAL_1(=ebx) in nlr_buf_t
+#define NLR_BUF_IDX_LOCAL_1 (5)
+
 // x86 needs a table to know how many args a given function has
 STATIC byte mp_f_n_args[MP_F_NUMBER_OF] = {
     [MP_F_CONVERT_OBJ_TO_NATIVE] = 2,
@@ -56,7 +59,7 @@ STATIC byte mp_f_n_args[MP_F_NUMBER_OF] = {
     [MP_F_DELETE_GLOBAL] = 1,
     [MP_F_NEW_CELL] = 1,
     [MP_F_MAKE_CLOSURE_FROM_RAW_CODE] = 3,
-    [MP_F_SETUP_CODE_STATE] = 5,
+    [MP_F_SETUP_CODE_STATE] = 4,
     [MP_F_SMALL_INT_FLOOR_DIVIDE] = 2,
     [MP_F_SMALL_INT_MODULO] = 2,
 };
